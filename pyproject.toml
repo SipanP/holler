@@ -1,0 +1,39 @@
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "holler"
+version = "0.0.1"
+description = "Peer-to-peer encrypted terminal chat. No servers. No logs. RAM only."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "aiortc",
+    "cryptography>=46.0.3",
+    "rich>=14.2.0",
+    "websockets>=15.0.1",
+]
+
+[project.scripts]
+holler = "holler.cli:main"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0",
+    "pyright>=1.1.390",
+    "ruff>=0.11",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.9"
+venvPath = "."
+venv = ".venv"

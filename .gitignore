@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (uv)
+.venv/
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+
+# Secrets
+*.pem
+*.key
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Misc
+.pytest_cache/
+.claude/
