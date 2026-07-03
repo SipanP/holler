@@ -3,7 +3,7 @@
 **Encrypted peer-to-peer group terminal chat — no servers in the message path, no logs, no trace.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 
 ---
@@ -115,7 +115,7 @@ uv run pre-commit install
 uv run pytest
 ```
 
-Ruff and Pyright run on every commit; CI runs the full test suite on Python 3.9 and 3.13. The test suite drives real clients over an in-memory transport, covering the handshake, gossip relay, ordering, key rotation, reconnection, and room takeover.
+Ruff and Pyright run on every commit; CI runs the full test suite on Python 3.10 and 3.13. The test suite drives real clients over an in-memory transport, covering the handshake, gossip relay, ordering, key rotation, reconnection, and room takeover.
 
 ## License
 

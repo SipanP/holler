@@ -7,7 +7,7 @@ name = "holler"
 version = "0.1.0"
 description = "Peer-to-peer encrypted terminal chat. No servers. No logs. RAM only."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "aiortc",
@@ -38,7 +38,7 @@ select = ["E", "F", "I"]
 
 [tool.pyright]
 include = ["src", "tests"]
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 venvPath = "."
 venv = ".venv"
 
