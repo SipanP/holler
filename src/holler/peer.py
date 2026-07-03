@@ -1,22 +1,51 @@
 """WebRTC peer connection management backed by PeerJS signaling."""
 
 import asyncio
+import contextlib
 import json
-import random
-import string
+import logging
 from typing import Any, Callable, Optional
 
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
-PEERJS_WS_URL = "wss://0.peerjs.com/peerjs"
+from holler.crypto import rand_id
+from holler.errors import PeerUnreachableError
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SIGNALING_URL = "wss://0.peerjs.com/peerjs"
+DEFAULT_STUN_URL = "stun:stun.l.google.com:19302"
 PEERJS_KEY = "peerjs"
 
-_ICE_CONFIG = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
+# The PeerJS server expires clients whose last heartbeat is older than its
+# alive timeout (60 s by default), so the client must ping proactively.
+HEARTBEAT_INTERVAL = 5.0
+RECONNECT_DELAYS = (1, 2, 4, 8, 16, 30, 30, 30)
 
 
-def _rand(n=6):
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+def build_ice_servers(
+    stun_url: str = DEFAULT_STUN_URL,
+    turn_url: Optional[str] = None,
+    turn_username: Optional[str] = None,
+    turn_password: Optional[str] = None,
+) -> "list[RTCIceServer]":
+    """Builds the ICE server list from CLI-style options.
+
+    Args:
+        stun_url: STUN server URL for NAT hole punching.
+        turn_url: Optional TURN relay URL (``turn:host:port``) used when hole
+            punching fails. TURN-over-UDP only; TCP relays are not configured
+            because holler peers never accept inbound TCP.
+        turn_username: TURN credential username.
+        turn_password: TURN credential password.
+    """
+    servers = [RTCIceServer(urls=stun_url)]
+    if turn_url:
+        servers.append(
+            RTCIceServer(urls=turn_url, username=turn_username, credential=turn_password)
+        )
+    return servers
 
 
 async def _wait_for_ice(pc: RTCPeerConnection):
@@ -36,9 +65,9 @@ class PeerConnection:
     """Manages multiple WebRTC DataChannel connections via PeerJS signaling.
 
     One instance holds a single PeerJS websocket (the peer's own ID) plus an
-    optional alias websocket (the room ID). All RTCPeerConnections and
-    DataChannels are managed centrally regardless of which websocket brokered
-    the handshake.
+    optional alias websocket (the room ID). Each websocket is supervised: the
+    client sends protocol heartbeats and transparently reconnects with
+    exponential backoff if the socket drops, re-registering the same ID.
 
     Attributes:
         peer_id: The ephemeral ID registered with PeerJS on start.
@@ -46,29 +75,44 @@ class PeerConnection:
             Signature: ``(peer_id: str, data: str) -> None``
         on_peer_connected: Callback fired when a DataChannel opens.
             Signature: ``(peer_id: str) -> None``
-        on_peer_disconnected: Callback fired when a DataChannel closes.
-            Signature: ``(peer_id: str) -> None``
+        on_peer_disconnected: Callback fired exactly once when an open
+            DataChannel goes away. Signature: ``(peer_id: str) -> None``
+        on_alias_lost: Callback fired when an alias registration could not be
+            restored after a signaling reconnect. Signature: ``(alias: str) -> None``
+        on_signaling_lost: Callback fired when the peer's own registration is
+            permanently lost. Existing DataChannels keep working, but no new
+            peers can dial in. Signature: ``() -> None``
     """
 
-    def __init__(self):
-        self.peer_id = _rand()
+    def __init__(
+        self,
+        signaling_url: str = DEFAULT_SIGNALING_URL,
+        ice_servers: "Optional[list[RTCIceServer]]" = None,
+    ):
+        self.peer_id = rand_id()
+        self._url = signaling_url
+        self._ice_config = RTCConfiguration(iceServers=ice_servers or build_ice_servers())
+
         self._websockets: dict[str, Any] = {}
-        self._signaling_tasks: dict[str, asyncio.Task] = {}
+        self._supervisors: dict[str, asyncio.Task] = {}
         self._pcs: dict[str, RTCPeerConnection] = {}
         self._channels: dict = {}
-        self._pending: dict[str, asyncio.Event] = {}
+        self._pending: dict[str, asyncio.Future] = {}
+        self._closing = False
 
         self.on_message: Optional[Callable[[str, str], None]] = None
         self.on_peer_connected: Optional[Callable[[str], None]] = None
         self.on_peer_disconnected: Optional[Callable[[str], None]] = None
+        self.on_alias_lost: Optional[Callable[[str], None]] = None
+        self.on_signaling_lost: Optional[Callable[[], None]] = None
 
     @property
-    def connected_peers(self) -> list[str]:
+    def connected_peers(self) -> "list[str]":
         """Returns the peer IDs of all currently open DataChannels."""
         return list(self._channels.keys())
 
     async def start(self):
-        """Registers ``peer_id`` with PeerJS and starts the signaling loop."""
+        """Registers ``peer_id`` with PeerJS and starts the supervised signaling loop."""
         await self._register(self.peer_id)
 
     async def register_alias(self, alias_id: str):
@@ -89,31 +133,36 @@ class PeerConnection:
         Args:
             alias_id: The alias ID to deregister.
         """
-        task = self._signaling_tasks.pop(alias_id, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        ws = self._websockets.pop(alias_id, None)
-        if ws:
-            await ws.close()
+        await self._teardown_registration(alias_id)
 
-    async def connect_to(self, target_peer_id: str):
+    async def connect_to(self, target_peer_id: str, timeout: float = 30.0):
         """Initiates a WebRTC connection to another peer and waits for the
         DataChannel to open.
 
         Args:
             target_peer_id: The PeerJS ID of the remote peer.
+            timeout: Seconds to wait for the channel to open.
 
         Raises:
-            asyncio.TimeoutError: If the channel does not open within 30 s.
+            PeerUnreachableError: If the peer does not exist, is gone, or did
+                not answer within the timeout.
+            ConnectionError: If our own signaling socket is unavailable.
         """
-        event = asyncio.Event()
-        self._pending[target_peer_id] = event
-        await self._send_offer(target_peer_id)
-        await asyncio.wait_for(event.wait(), timeout=30)
+        if target_peer_id in self._channels:
+            return
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[target_peer_id] = fut
+        try:
+            await self._send_offer(target_peer_id)
+            await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            raise PeerUnreachableError(f"{target_peer_id} did not answer") from None
+        finally:
+            self._pending.pop(target_peer_id, None)
+            if target_peer_id not in self._channels:
+                pc = self._pcs.pop(target_peer_id, None)
+                if pc:
+                    asyncio.create_task(pc.close())
 
     async def send_to(self, peer_id: str, data: str):
         """Sends a message to a specific connected peer.
@@ -124,7 +173,10 @@ class PeerConnection:
         """
         ch = self._channels.get(peer_id)
         if ch and ch.readyState == "open":
-            ch.send(data)
+            try:
+                ch.send(data)
+            except Exception:
+                logger.debug("send to %s failed", peer_id, exc_info=True)
 
     async def broadcast(self, data: str):
         """Sends a message to every currently open DataChannel.
@@ -132,41 +184,135 @@ class PeerConnection:
         Args:
             data: Message string to send.
         """
-        for ch in list(self._channels.values()):
-            if ch.readyState == "open":
-                ch.send(data)
+        for peer_id in list(self._channels.keys()):
+            await self.send_to(peer_id, data)
+
+    async def drop(self, peer_id: str):
+        """Tears down the connection to one peer (used for dead-link recovery)."""
+        self._channel_gone(peer_id)
 
     async def close(self):
         """Cancels all signaling tasks, closes all websockets and RTCPeerConnections."""
-        for task in list(self._signaling_tasks.values()):
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        for ws in list(self._websockets.values()):
-            await ws.close()
-        for pc in self._pcs.values():
+        self._closing = True
+        for peer_id in list(self._supervisors.keys()):
+            await self._teardown_registration(peer_id)
+        for pc in list(self._pcs.values()):
             await pc.close()
+        self._pcs.clear()
+        self._channels.clear()
 
-    # ── internals ────────────────────────────────────────────────────────────
+    # ── signaling lifecycle ──────────────────────────────────────────────────
 
     async def _register(self, peer_id: str):
-        url = f"{PEERJS_WS_URL}?key={PEERJS_KEY}&id={peer_id}&token={_rand()}"
+        ws = await self._connect_ws(peer_id)
+        self._websockets[peer_id] = ws
+        self._supervisors[peer_id] = asyncio.create_task(self._supervise(peer_id, ws))
+
+    async def _connect_ws(self, peer_id: str):
+        url = f"{self._url}?key={PEERJS_KEY}&id={peer_id}&token={rand_id(16)}"
         ws = await websockets.connect(url)
-        msg = json.loads(await ws.recv())
+        try:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        except Exception:
+            await ws.close()
+            raise ConnectionError("PeerJS registration failed: no response") from None
         if msg.get("type") != "OPEN":
             await ws.close()
             raise ConnectionError(f"PeerJS registration failed: {msg}")
-        self._websockets[peer_id] = ws
-        self._signaling_tasks[peer_id] = asyncio.create_task(self._signaling_loop(ws))
+        return ws
+
+    async def _teardown_registration(self, peer_id: str):
+        task = self._supervisors.pop(peer_id, None)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        ws = self._websockets.pop(peer_id, None)
+        if ws:
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+    async def _supervise(self, peer_id: str, ws: Any):
+        """Runs the signaling loop for one registration, reconnecting on drops."""
+        while not self._closing:
+            heartbeat = asyncio.create_task(self._heartbeat(ws))
+            try:
+                await self._signaling_loop(ws)
+            except asyncio.CancelledError:
+                heartbeat.cancel()
+                raise
+            except Exception:
+                logger.debug("signaling loop for %s errored", peer_id, exc_info=True)
+            finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+            self._websockets.pop(peer_id, None)
+            if self._closing:
+                return
+
+            ws = await self._reconnect_ws(peer_id)
+            if ws is None:
+                # Deregister ourselves without cancelling our own task.
+                self._supervisors.pop(peer_id, None)
+                if peer_id == self.peer_id:
+                    if self.on_signaling_lost:
+                        self.on_signaling_lost()
+                elif self.on_alias_lost:
+                    self.on_alias_lost(peer_id)
+                return
+            self._websockets[peer_id] = ws
+
+    async def _reconnect_ws(self, peer_id: str):
+        for delay in RECONNECT_DELAYS:
+            await asyncio.sleep(delay)
+            if self._closing:
+                return None
+            try:
+                return await self._connect_ws(peer_id)
+            except Exception:
+                continue
+        return None
+
+    async def _heartbeat(self, ws: Any):
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await ws.send(json.dumps({"type": "HEARTBEAT"}))
+
+    async def _signaling_loop(self, ws: Any):
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+                t = msg.get("type")
+
+                if t == "OFFER":
+                    await self._handle_offer(ws, msg["src"], msg["payload"])
+                elif t == "ANSWER":
+                    await self._handle_answer(msg["src"], msg["payload"])
+                elif t in ("LEAVE", "EXPIRE"):
+                    self._fail_pending(msg.get("src"))
+        except websockets.ConnectionClosed:
+            pass
+
+    def _fail_pending(self, src: Optional[str]):
+        """Fails a pending dial fast when signaling reports the target is gone."""
+        if not src:
+            return
+        fut = self._pending.get(src)
+        if fut and not fut.done():
+            fut.set_exception(PeerUnreachableError(f"{src} is not reachable"))
+
+    # ── WebRTC handshake ─────────────────────────────────────────────────────
 
     async def _send_offer(self, target: str):
-        ws = self._websockets[self.peer_id]
-        pc = RTCPeerConnection(configuration=_ICE_CONFIG)
+        ws = self._websockets.get(self.peer_id)
+        if ws is None:
+            raise ConnectionError("signaling connection unavailable")
+        pc = RTCPeerConnection(configuration=self._ice_config)
         self._pcs[target] = pc
         ch = pc.createDataChannel("chat")
         self._bind_channel(target, ch)
+        self._bind_pc(target, pc)
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
@@ -183,8 +329,25 @@ class PeerConnection:
         )
 
     async def _handle_offer(self, ws: Any, src: str, payload: dict):
-        pc = RTCPeerConnection(configuration=_ICE_CONFIG)
+        if src in self._pending:
+            # Glare: both sides dialed simultaneously. Deterministic tie-break —
+            # the lexicographically lower peer ID stays the offerer.
+            if self.peer_id < src:
+                return
+            old = self._pcs.pop(src, None)
+            if old:
+                await old.close()
+        elif src in self._channels:
+            # The remote considers the old link dead and is re-dialing; drop
+            # our side and accept the fresh connection.
+            old_pc = self._pcs.pop(src, None)
+            self._channel_gone(src)
+            if old_pc:
+                await old_pc.close()
+
+        pc = RTCPeerConnection(configuration=self._ice_config)
         self._pcs[src] = pc
+        self._bind_pc(src, pc)
 
         @pc.on("datachannel")
         def on_datachannel(ch):
@@ -207,46 +370,46 @@ class PeerConnection:
 
     async def _handle_answer(self, src: str, payload: dict):
         pc = self._pcs.get(src)
-        if pc:
-            await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=payload["sdp"], type="answer")
-            )
+        if pc and pc.signalingState == "have-local-offer":
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=payload["sdp"], type="answer"))
+
+    def _bind_pc(self, peer_id: str, pc: RTCPeerConnection):
+        @pc.on("connectionstatechange")
+        def on_state_change():
+            if pc.connectionState in ("failed", "closed") and self._pcs.get(peer_id) is pc:
+                self._channel_gone(peer_id)
 
     def _bind_channel(self, peer_id: str, ch):
-        @ch.on("open")
         def on_open():
             self._channels[peer_id] = ch
-            if peer_id in self._pending:
-                self._pending.pop(peer_id).set()
+            fut = self._pending.get(peer_id)
+            if fut and not fut.done():
+                fut.set_result(None)
             if self.on_peer_connected:
                 self.on_peer_connected(peer_id)
 
+        ch.on("open", on_open)
+
         @ch.on("message")
         def on_message(data):
-            if self.on_message:
+            if self.on_message and isinstance(data, str):
                 self.on_message(peer_id, data)
 
         @ch.on("close")
         def on_close():
-            self._channels.pop(peer_id, None)
-            if self.on_peer_disconnected:
-                self.on_peer_disconnected(peer_id)
+            if self._channels.get(peer_id) is ch:
+                self._channel_gone(peer_id)
 
-    async def _signaling_loop(self, ws: Any):
-        try:
-            async for raw in ws:
-                msg = json.loads(raw)
-                t = msg.get("type")
+        # Remotely-created channels are already open when aiortc emits the
+        # "datachannel" event, so the "open" event will never fire for them.
+        if ch.readyState == "open":
+            on_open()
 
-                if t == "HEARTBEAT":
-                    await ws.send(json.dumps({"type": "HEARTBEAT"}))
-                elif t == "OFFER":
-                    await self._handle_offer(ws, msg["src"], msg["payload"])
-                elif t == "ANSWER":
-                    await self._handle_answer(msg["src"], msg["payload"])
-                elif t in ("LEAVE", "EXPIRE"):
-                    src = msg.get("src")
-                    if src:
-                        self._channels.pop(src, None)
-        except (websockets.ConnectionClosed, asyncio.CancelledError):
-            pass
+    def _channel_gone(self, peer_id: str):
+        """Removes a peer's channel + pc, firing ``on_peer_disconnected`` once."""
+        had_channel = self._channels.pop(peer_id, None) is not None
+        pc = self._pcs.pop(peer_id, None)
+        if pc:
+            asyncio.create_task(pc.close())
+        if had_channel and self.on_peer_disconnected:
+            self.on_peer_disconnected(peer_id)
