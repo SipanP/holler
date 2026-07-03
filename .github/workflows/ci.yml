@@ -34,3 +34,27 @@ jobs:
 
       - name: Tests
         run: uv run pytest -q
+
+  # Live smoke test against the public 0.peerjs.com signaling server.
+  # Non-blocking: it depends on a third-party service and the runner's
+  # network, so a failure emits a warning instead of failing the pipeline.
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: E2E smoke vs 0.peerjs.com (non-blocking)
+        run: |
+          if timeout 180 uv run python tests/e2e_smoke.py; then
+            echo "e2e smoke passed"
+          else
+            echo "::warning title=E2E smoke test failed::Live test against 0.peerjs.com failed. This does not block the pipeline — it may be a transient network or third-party outage, but check the job log in case a real regression is hiding here."
+          fi
