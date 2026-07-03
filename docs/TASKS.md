@@ -2,6 +2,12 @@
 
 Assessment of the proposed recommendations (gossip routing, Lamport ordering, SRP, reconnection, TURN, AES-GCM, configurable signaling, typing/presence, metadata mitigation) against the current codebase, plus additional findings from a code review — reconciled into a single prioritized task list.
 
+> **Status: all tasks below are implemented** (protocol v3). Line references in Part 2
+> describe the *pre-rewrite* code and are kept for the historical record. One additional
+> bug was found during implementation: aiortc delivers remotely-created DataChannels
+> already in the `open` state, so the answerer's `open` event never fired and the
+> host side never started its handshake (fixed in `peer.py:_bind_channel`).
+
 ---
 
 ## Part 1: Verdicts on the original 9 recommendations
@@ -57,39 +63,39 @@ Assessment of the proposed recommendations (gossip routing, Lamport ordering, SR
 
 ### P0 — Correctness & security bugs (fix first)
 
-| # | Task | Sources |
-|---|------|---------|
-| 1 | PeerJS client keepalive + signaling websocket reconnect with backoff and alias re-registration | B1, B2 |
-| 2 | Loud handshake failure: replace asserts with validation, add key-confirmation round, join timeout with clear error messages | B3, B10, doc #3 (UX part) |
-| 3 | Connection lifecycle cleanup: clear `_pending`/`_connecting` on failure, close stale `RTCPeerConnection`s, glare tie-break, consistent LEAVE/EXPIRE handling | B4, B5, B6 |
-| 4 | Display names from authenticated handshake state, not message fields | B7 (quick fix) |
-| 5 | `secrets`-based IDs with longer room IDs; `getpass` for the password | B8, B9 |
+| # | Task | Sources | Status |
+|---|------|---------|--------|
+| 1 | PeerJS client keepalive + signaling websocket reconnect with backoff and alias re-registration | B1, B2 | ✅ `peer.py` supervisors |
+| 2 | Loud handshake failure: replace asserts with validation, add key-confirmation round, join timeout with clear error messages | B3, B10, doc #3 (UX part) | ✅ `client.py:_handshake`, typed errors |
+| 3 | Connection lifecycle cleanup: clear `_pending`/`_connecting` on failure, close stale `RTCPeerConnection`s, glare tie-break, consistent LEAVE/EXPIRE handling | B4, B5, B6 | ✅ `peer.py` |
+| 4 | Display names from authenticated handshake state, not message fields | B7 (quick fix) | ✅ identity from handshake only |
+| 5 | `secrets`-based IDs with longer room IDs; `getpass` for the password | B8, B9 | ✅ `crypto.rand_id`, `cli.py` |
 
 ### P1 — Resilience
 
-| # | Task | Sources |
-|---|------|---------|
-| 6 | Gossip/flood routing: message ID + origin + TTL envelope, bounded seen-set, re-broadcast on receive | doc #1 |
-| 7 | Lamport timestamps with deterministic `(ts, origin)` sort for display | doc #2 |
-| 8 | DataChannel heartbeats + per-peer reconnection state machine with exponential backoff | doc #4 |
+| # | Task | Sources | Status |
+|---|------|---------|--------|
+| 6 | Gossip/flood routing: message ID + origin + TTL envelope, bounded seen-set, re-broadcast on receive | doc #1 | ✅ `client.py` gossip + `SeenCache` |
+| 7 | Lamport timestamps with deterministic `(ts, origin)` sort for display | doc #2 | ✅ `LamportClock`, sorted log |
+| 8 | DataChannel heartbeats + per-peer reconnection state machine with exponential backoff | doc #4 | ✅ monitor loop + `_reconnect` |
 
 ### P2 — Security hardening
 
-| # | Task | Sources |
-|---|------|---------|
-| 9 | PAKE authentication — SPAKE2 recommended over SRP; defeats offline dictionary attack by an active MITM | doc #3 (reframed) |
-| 10 | Envelope redesign: AES-256-GCM with sender ID / timestamp / message ID bound via AAD; gives replay protection and unspoofable metadata | doc #6, B7 (long-term) |
-| 11 | Optional TURN server CLI flags (`--turn`, `--turn-user`, `--turn-pass`); TURN-over-TCP disabled | doc #5 |
+| # | Task | Sources | Status |
+|---|------|---------|--------|
+| 9 | PAKE authentication — SPAKE2 recommended over SRP; defeats offline dictionary attack by an active MITM | doc #3 (reframed) | ✅ `PairwiseHandshake` |
+| 10 | Envelope redesign: AES-256-GCM with sender ID / timestamp / message ID bound via AAD; gives replay protection and unspoofable metadata | doc #6, B7 (long-term) | ✅ `crypto.seal`/`open_any` |
+| 11 | Optional TURN server CLI flags (`--turn`, `--turn-user`, `--turn-pass`); TURN-over-TCP disabled | doc #5 | ✅ `peer.build_ice_servers` |
 
 ### P3 — Configurability & polish
 
-| # | Task | Sources |
-|---|------|---------|
-| 12 | Configurable signaling server flag (`--signaling`), default `0.peerjs.com` | doc #7, doc #9 |
-| 13 | Test suite (pytest, fake transport) + CI workflow | I1 |
-| 14 | Terminal UX: non-clobbering input line, bounded message history, clean quit | I2 |
-| 15 | README corrections: metadata claim, MITM caveat | I4 |
-| 16 | Typing indicators; sender-key rotation on membership change — both optional | doc #8, I3 |
+| # | Task | Sources | Status |
+|---|------|---------|--------|
+| 12 | Configurable signaling server flag (`--signaling`), default `0.peerjs.com` | doc #7, doc #9 | ✅ |
+| 13 | Test suite (pytest, fake transport) + CI workflow | I1 | ✅ 22 tests + GitHub Actions |
+| 14 | Terminal UX: non-clobbering input line, bounded message history, clean quit | I2 | ✅ prompt_toolkit UI |
+| 15 | README corrections: metadata claim, MITM caveat | I4 | ✅ rewritten |
+| 16 | Typing indicators; sender-key rotation on membership change — both optional | doc #8, I3 | ✅ both implemented |
 
 ### Sequencing notes
 

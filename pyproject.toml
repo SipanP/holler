@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "holler"
-version = "0.0.1"
+version = "0.1.0"
 description = "Peer-to-peer encrypted terminal chat. No servers. No logs. RAM only."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,9 @@ license = { text = "MIT" }
 dependencies = [
     "aiortc",
     "cryptography>=46.0.3",
+    "prompt-toolkit>=3.0",
     "rich>=14.2.0",
+    "spake2>=0.9",
     "websockets>=15.0.1",
 ]
 
@@ -23,6 +25,8 @@ holler = "holler.cli:main"
 dev = [
     "pre-commit>=4.0",
     "pyright>=1.1.390",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "ruff>=0.11",
 ]
 
@@ -33,7 +37,11 @@ line-length = 100
 select = ["E", "F", "I"]
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "tests"]
 pythonVersion = "3.9"
 venvPath = "."
 venv = ".venv"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

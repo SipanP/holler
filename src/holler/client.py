@@ -1,148 +1,327 @@
-"""Encrypted group chat client built on top of PeerConnection."""
+"""Encrypted group chat client built on top of PeerConnection.
+
+Wire protocol (v3)
+==================
+
+Direct messages (one DataChannel, never relayed):
+
+- ``holler.kex``      — real peer ID + SPAKE2 message + X25519 public key.
+- ``holler.confirm``  — key-confirmation MAC; fails loudly on password mismatch.
+- ``holler.sec``      — pairwise-encrypted payload: sender key, username, and
+  (from the host side) the roster and room ID.
+- ``holler.rekey``    — pairwise-encrypted replacement sender key, sent when
+  the group membership shrinks.
+- ``holler.ping``     — liveness heartbeat; any inbound traffic counts.
+
+Gossip envelopes (``holler.gossip``) carry chat, leave, and typing events.
+Every envelope has a unique ID, the origin's real peer ID, a TTL, and a
+Lamport timestamp; the body is AES-256-GCM sealed with the origin's sender
+key, with all envelope metadata bound as AAD. Peers re-broadcast envelopes
+they have not seen before, so messages survive individual dead links as long
+as any path through the mesh exists.
+"""
 
 import asyncio
 import base64
+import bisect
+import contextlib
 import json
 import os
-from dataclasses import dataclass
+import secrets
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from rich.console import Console
-from rich.panel import Panel
+from holler.crypto import LamportClock, PairwiseHandshake, SeenCache, open_any, rand_id, seal
+from holler.errors import AuthenticationError, PeerUnreachableError, ProtocolError
+from holler.peer import PeerConnection
 
-from holler.peer import PeerConnection, _rand
+GOSSIP_TTL = 8
+MAX_LOG_ENTRIES = 1000
+TYPING_EXPIRY = 4.0
+TYPING_SEND_GAP = 2.0
+
+
+def _b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+def _b64d(data: dict, name: str) -> bytes:
+    value = data.get(name)
+    if not isinstance(value, str):
+        raise ProtocolError(f"missing field: {name}")
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception:
+        raise ProtocolError(f"invalid base64 in field: {name}") from None
 
 
 @dataclass
 class PeerState:
-    """Per-peer cryptographic state established during the handshake.
+    """Per-connection state established during the handshake.
 
     Attributes:
-        username: Display name received during the join exchange.
-        pairwise_fernet: Fernet instance keyed with the ECDH-derived pairwise
-            key. Used only to distribute and receive sender keys, not for chat
-            messages.
-        their_sender_fernet: Fernet instance keyed with the remote peer's
-            sender key. Used to decrypt all incoming chat messages from that
-            peer.
+        channel_key: The transport-level key for this DataChannel. For a
+            joiner's first connection this is the *room alias*, not the host's
+            real peer ID — which is why ``peer_id`` is exchanged explicitly.
+        peer_id: The remote peer's real (self-registered) ID, learned in kex.
+        username: Display name received during the handshake.
+        pairwise: Pairwise AEAD established via SPAKE2 + X25519. Used only for
+            handshake payloads and rekeys, never for chat messages.
+        ready: True once the handshake completed and the peer is in the mesh.
+        last_seen: ``time.monotonic()`` of the last inbound message.
     """
 
+    channel_key: str
+    peer_id: Optional[str] = None
     username: Optional[str] = None
-    pairwise_fernet: Optional[Fernet] = None
-    their_sender_fernet: Optional[Fernet] = None
+    pairwise: Optional[Any] = None
+    ready: bool = False
+    last_seen: float = field(default_factory=time.monotonic)
 
 
 class Client:
-    """Terminal chat client that manages the full mesh and encryption lifecycle.
+    """Headless chat client managing the mesh, encryption, and resilience.
 
-    Each ``Client`` instance owns one ``PeerConnection`` (its ephemeral peer
-    ID) plus optionally a room ID alias when it is the current room holder.
-    Cryptographic state is split into two layers:
+    All user-visible output flows through the ``on_event`` callback, so the
+    client can run under a terminal UI or a test harness unchanged.
 
-    - **Pairwise layer** — one ECDH-derived key per peer pair, used only to
-      distribute sender keys during the handshake.
-    - **Sender key layer** — one random 32-byte key per peer. Each peer
-      encrypts all their outbound messages with their own sender key and
-      broadcasts the ciphertext; recipients decrypt with the stored copy.
+    Emitted events (``on_event(kind, payload)``):
+
+    - ``room``      — ``{room_id}`` after creating a room.
+    - ``chat``      — ``{username, text, wall, lam, origin}``.
+    - ``info``      — ``{text}`` status lines (joins, leaves, reconnects).
+    - ``error``     — ``{text}`` recoverable failures worth surfacing.
+    - ``presence``  — ``{online: [usernames]}`` whenever membership changes.
+    - ``typing``    — ``{users: [usernames]}`` whenever the typing set changes.
 
     Args:
         username: Display name shown to other peers.
-        password: Shared secret used to authenticate the ECDH key exchange.
-            Never transmitted.
+        password: Shared secret proven via SPAKE2 during every pairwise
+            handshake. Never transmitted, and not offline-attackable by an
+            active MITM.
         join_id: Room ID to join. If ``None``, a new room is created.
+        signaling_url: PeerJS-compatible signaling server websocket URL.
+        ice_servers: Optional list of ``RTCIceServer`` (STUN/TURN).
+        peer_factory: Factory returning a ``PeerConnection``-compatible
+            transport; injectable for tests.
+        ping_interval: Seconds between liveness pings on each channel.
+        stale_after: Seconds without inbound traffic before a link is
+            considered dead and reconnection starts.
+        reconnect_delays: Backoff schedule (seconds) for redial attempts.
+        on_event: Callback receiving ``(kind, payload)`` events.
     """
 
-    def __init__(self, username: str, password: str, join_id: Optional[str] = None):
-        self.username = username
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        join_id: Optional[str] = None,
+        *,
+        signaling_url: Optional[str] = None,
+        ice_servers: Optional[list] = None,
+        peer_factory: Optional[Callable[[], Any]] = None,
+        ping_interval: float = 5.0,
+        stale_after: float = 30.0,
+        handshake_timeout: float = 45.0,
+        join_timeout: float = 60.0,
+        reconnect_delays: "tuple[float, ...]" = (1, 2, 4, 8, 16),
+        on_event: Optional[Callable[[str, dict], None]] = None,
+    ):
+        self.username = username[:64]
         self.password = password.encode()
         self.join_id = join_id
-
-        self.console = Console()
-        self.messages: list[dict] = []
+        self.on_event = on_event
         self.running = False
+        self.log: list = []  # entries sorted by (lamport, origin, msg_id)
 
-        self._private_key: Optional[X25519PrivateKey] = None
-        self._sender_key: Optional[bytes] = None
-        self._sender_fernet: Optional[Fernet] = None
+        def default_factory() -> PeerConnection:
+            kwargs: dict = {}
+            if signaling_url:
+                kwargs["signaling_url"] = signaling_url
+            if ice_servers:
+                kwargs["ice_servers"] = ice_servers
+            return PeerConnection(**kwargs)
 
-        self._peer: Optional[PeerConnection] = None
-        self._peers: dict[str, PeerState] = {}
-        self._peer_queues: dict[str, asyncio.Queue] = {}
-        self._initiated: set[str] = set()
-        self._connecting: set[str] = set()
-        self._first_peer_ready: asyncio.Event = asyncio.Event()
+        self._peer_factory = peer_factory or default_factory
+        self._ping_interval = ping_interval
+        self._stale_after = stale_after
+        self._handshake_timeout = handshake_timeout
+        self._join_timeout = join_timeout
+        self._reconnect_delays = reconnect_delays
+
+        self._peer: Optional[Any] = None
+        self._sender_key: bytes = b""
+        self._sender_keys: dict[str, list] = {}  # real peer ID -> [newest, previous]
+        self._usernames: dict[str, str] = {}  # real peer ID -> display name
+        self._states: dict[str, PeerState] = {}  # channel key -> state
+        self._queues: dict[str, asyncio.Queue] = {}  # channel key -> handshake queue
+        self._initiated: set = set()
+        self._connecting: set = set()
+        self._reconnecting: set = set()  # real peer IDs mid-reconnect
+        self._departing: set = set()  # real peer IDs that announced leaving
+        self._typing: dict[str, float] = {}  # username -> last typing signal
+        self._last_typing_sent = 0.0
+
+        self._clock = LamportClock()
+        self._seen = SeenCache()
 
         self._room_id: Optional[str] = None
-        self._holding_room: bool = False
-        self._acquiring_room: bool = False
+        self._holding_room = False
+        self._acquiring_room = False
 
-    def _generate_keypair(self):
-        self._private_key = X25519PrivateKey.generate()
+        self._join_future: Optional[asyncio.Future] = None
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._tasks: set = set()
+        self._stopped = False
 
-    def _generate_sender_key(self):
-        self._sender_key = os.urandom(32)
-        self._sender_fernet = Fernet(base64.urlsafe_b64encode(self._sender_key))
+    # ── public API ────────────────────────────────────────────────────────────
 
-    def _derive_pairwise_key(self, peer_public_bytes: bytes) -> bytes:
-        """Derives the pairwise key from an ECDH exchange authenticated by the password.
+    @property
+    def room_id(self) -> Optional[str]:
+        return self._room_id
 
-        Args:
-            peer_public_bytes: The remote peer's raw X25519 public key bytes.
+    @property
+    def online(self) -> "list[str]":
+        """Usernames currently in the mesh, self first."""
+        others = sorted(st.username for st in self._states.values() if st.ready and st.username)
+        return [self.username] + others
 
-        Returns:
-            32-byte pairwise key suitable for use as a Fernet key.
+    async def start(self):
+        """Connects to signaling and either creates or joins a room.
+
+        Raises:
+            AuthenticationError: Wrong password (key confirmation failed).
+            PeerUnreachableError: The room ID does not exist or timed out.
+            ConnectionError: The signaling server rejected us.
         """
-        assert self._private_key is not None
-        shared = self._private_key.exchange(X25519PublicKey.from_public_bytes(peer_public_bytes))
-        return HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=b"holler-p2p-v2",
-            info=b"holler-pairwise-key",
-        ).derive(shared + self.password)
+        self._sender_key = os.urandom(32)
+        peer = self._peer_factory()
+        self._peer = peer
+        peer.on_message = self._on_message
+        peer.on_peer_connected = self._on_peer_connected
+        peer.on_peer_disconnected = self._on_channel_closed
+        peer.on_alias_lost = self._on_alias_lost
+        peer.on_signaling_lost = self._on_signaling_lost
+        await peer.start()
+        self.running = True
+        self._monitor_task = asyncio.create_task(self._monitor())
+
+        if self.join_id:
+            self._join_future = asyncio.get_running_loop().create_future()
+            self._track(asyncio.create_task(self._connect_to_peer(self.join_id)))
+            try:
+                await asyncio.wait_for(self._join_future, self._join_timeout)
+            except asyncio.TimeoutError:
+                await self.stop()
+                raise PeerUnreachableError("timed out joining the room") from None
+            except Exception:
+                await self.stop()
+                raise
+        else:
+            self._room_id = rand_id()
+            await self._acquire_room()
+            if not self._holding_room:
+                await self.stop()
+                raise ConnectionError("could not register a room ID with the signaling server")
+            self._emit("room", room_id=self._room_id)
+
+    async def send_chat(self, text: str):
+        """Encrypts ``text`` with the sender key and gossips it to the group."""
+        assert self._peer is not None
+        wall = self._now()
+        msg_id, lam = await self._gossip_out("chat", {"text": text, "wall": wall})
+        self._append_log(lam, self._peer.peer_id, msg_id, self.username, text, wall)
+
+    def notify_typing(self):
+        """Signals (rate-limited) that this user is typing."""
+        if not self.running:
+            return
+        now = time.monotonic()
+        if now - self._last_typing_sent < TYPING_SEND_GAP:
+            return
+        self._last_typing_sent = now
+        self._track(asyncio.create_task(self._gossip_out("typing", {})))
+
+    async def stop(self):
+        """Announces departure, releases the room, and tears everything down."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self.running = False
+        if self._peer:
+            with contextlib.suppress(Exception):
+                await self._gossip_out("leave", {})
+                await asyncio.sleep(0.1)
+            if self._holding_room:
+                with contextlib.suppress(Exception):
+                    await self._release_room()
+            with contextlib.suppress(Exception):
+                await self._peer.close()
+        if self._monitor_task:
+            self._monitor_task.cancel()
+        # Two passes: tasks may spawn small cleanup tasks from their finally blocks.
+        for _ in range(2):
+            pending = list(self._tasks)
+            if not pending:
+                break
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _emit(self, kind: str, **payload):
+        if self.on_event:
+            try:
+                self.on_event(kind, payload)
+            except Exception:
+                pass
+
+    def _track(self, task: asyncio.Task) -> asyncio.Task:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()[:19].replace("T", " ")
 
-    def _info(self, msg: str):
-        self.console.print(f"[green]✓ {msg}[/]")
+    async def _send(self, channel_key: str, obj: dict):
+        assert self._peer is not None
+        await self._peer.send_to(channel_key, json.dumps(obj))
 
-    def render(self):
-        """Redraws the terminal UI with the current online list and message history."""
-        self.console.clear()
-        usernames = [self.username] + [s.username for s in self._peers.values() if s.username]
-        self.console.print(f"[dim]Online: {', '.join(usernames)}[/]")
-        self.console.print("─" * 60)
+    def _append_log(self, lam: int, origin: str, msg_id: str, username: str, text: str, wall: str):
+        entry = {
+            "lam": lam,
+            "origin": origin,
+            "username": username,
+            "text": text,
+            "wall": wall,
+        }
+        bisect.insort(self.log, ((lam, origin, msg_id), entry))
+        if len(self.log) > MAX_LOG_ENTRIES:
+            del self.log[0]
+        self._emit("chat", **entry)
 
-        for msg in self.messages[-15:]:
-            style = "green" if msg["username"] == self.username else "cyan"
-            self.console.print(
-                f"[dim]{msg['timestamp']}[/] [{style}]{msg['username']}[/]: {msg['text']}"
-            )
+    def _find_ready(self, real_id: str) -> Optional[PeerState]:
+        for st in self._states.values():
+            if st.peer_id == real_id and st.ready:
+                return st
+        return None
 
-        if not self.messages:
-            self.console.print("[dim italic]No messages yet...[/]")
-
-        self.console.print("─" * 60)
-        self.console.print("[dim]Type message and press Enter. 'q' to quit.[/]")
+    def _emit_presence(self):
+        self._emit("presence", online=self.online)
 
     # ── room holder logic ─────────────────────────────────────────────────────
 
     def _should_hold_room(self) -> bool:
-        """Returns True if this peer has the lexicographically lowest ID in the mesh.
-
-        The room holder is always the peer with the lowest ID, giving a
-        deterministic tiebreaker that all peers can compute independently
-        without coordination.
-        """
+        """True if this peer has the lexicographically lowest real ID in the mesh."""
         assert self._peer is not None
-        all_ids = [self._peer.peer_id] + list(self._peers.keys())
-        return min(all_ids) == self._peer.peer_id
+        ids = [self._peer.peer_id] + [
+            st.peer_id for st in self._states.values() if st.ready and st.peer_id
+        ]
+        return min(ids) == self._peer.peer_id
 
     async def _acquire_room(self):
         """Registers the room ID alias with PeerJS, retrying up to 5 times.
@@ -155,17 +334,18 @@ class Client:
         if self._holding_room or self._acquiring_room:
             return
         self._acquiring_room = True
-        for _ in range(5):
-            try:
-                await self._peer.register_alias(self._room_id)
-                self._holding_room = True
-                break
-            except ConnectionError:
-                await asyncio.sleep(1)
-        self._acquiring_room = False
+        try:
+            for _ in range(5):
+                try:
+                    await self._peer.register_alias(self._room_id)
+                    self._holding_room = True
+                    return
+                except ConnectionError:
+                    await asyncio.sleep(1)
+        finally:
+            self._acquiring_room = False
 
     async def _release_room(self):
-        """Deregisters the room ID alias from PeerJS."""
         assert self._peer is not None
         assert self._room_id is not None
         if not self._holding_room:
@@ -176,258 +356,481 @@ class Client:
     async def _reevaluate_room_holder(self):
         """Acquires or releases the room ID based on the current peer list.
 
-        Called whenever a peer joins or leaves. Because all peers apply the
-        same deterministic rule (lowest peer ID holds the room), no
-        coordination messages are needed.
+        Idempotent and called on every membership change plus periodically
+        from the monitor loop, so a lost registration heals on its own.
         """
-        if self._room_id is None:
+        if self._room_id is None or not self.running:
             return
         if self._should_hold_room() and not self._holding_room:
             await self._acquire_room()
         elif not self._should_hold_room() and self._holding_room:
             await self._release_room()
 
-    # ── peer event callbacks ──────────────────────────────────────────────────
+    def _on_alias_lost(self, alias: str):
+        if alias == self._room_id:
+            self._holding_room = False
+            self._emit("info", text="room registration lost — retrying in background")
 
-    def _on_message(self, peer_id: str, raw: str):
-        q = self._peer_queues.get(peer_id)
+    def _on_signaling_lost(self):
+        self._emit(
+            "error",
+            text="signaling connection lost — existing chats keep working, "
+            "but new peers cannot join through you",
+        )
+
+    # ── transport callbacks ───────────────────────────────────────────────────
+
+    def _on_message(self, channel_key: str, raw: str):
+        st = self._states.get(channel_key)
+        if st:
+            st.last_seen = time.monotonic()
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+
+        t = data.get("type")
+        if t == "holler.gossip":
+            if st and st.ready:
+                self._handle_gossip(channel_key, data)
+        elif t == "holler.ping":
+            pass  # last_seen already updated
+        elif t == "holler.rekey":
+            if st and st.ready:
+                self._handle_rekey(st, data)
+        else:
+            q = self._queues.get(channel_key)
+            if q:
+                q.put_nowait(data)
+
+    def _on_peer_connected(self, channel_key: str):
+        st = PeerState(channel_key)
+        self._states[channel_key] = st
+        queue: asyncio.Queue = asyncio.Queue()
+        self._queues[channel_key] = queue
+        is_initiator = channel_key in self._initiated
+        self._initiated.discard(channel_key)
+        self._track(asyncio.create_task(self._peer_session(st, queue, is_initiator)))
+
+    def _on_channel_closed(self, channel_key: str):
+        q = self._queues.get(channel_key)
         if q:
-            q.put_nowait(raw)
-
-    def _on_peer_connected(self, peer_id: str):
-        self._peers[peer_id] = PeerState()
-        self._peer_queues[peer_id] = asyncio.Queue()
-        is_initiator = peer_id in self._initiated
-        self._initiated.discard(peer_id)
-        self._connecting.discard(peer_id)
-        asyncio.create_task(self._peer_session(peer_id, is_initiator))
-
-    def _on_channel_closed(self, peer_id: str):
-        q = self._peer_queues.get(peer_id)
-        if q:
-            q.put_nowait(json.dumps({"type": "_disconnect"}))
+            q.put_nowait(None)
 
     # ── connection management ─────────────────────────────────────────────────
 
-    async def _connect_to_peer(self, peer_id: str):
+    async def _connect_to_peer(self, target: str):
+        """Dials ``target`` unless it is us, already connected, or in progress."""
         assert self._peer is not None
-        if peer_id == self._peer.peer_id:
+        if target == self._peer.peer_id or target in self._connecting:
             return
-        if peer_id in self._peers or peer_id in self._connecting:
+        if target in self._states:
             return
-        self._connecting.add(peer_id)
-        self._initiated.add(peer_id)
-        await self._peer.connect_to(peer_id)
+        if any(st.peer_id == target for st in self._states.values()):
+            return
+        self._connecting.add(target)
+        self._initiated.add(target)
+        try:
+            await self._peer.connect_to(target)
+        except Exception as exc:
+            self._initiated.discard(target)
+            if self._join_future and target == self.join_id and not self._join_future.done():
+                self._join_future.set_exception(exc)
+            else:
+                self._emit("info", text=f"could not reach peer {target}")
+        finally:
+            self._connecting.discard(target)
 
     # ── per-peer session ──────────────────────────────────────────────────────
 
-    async def _peer_session(self, peer_id: str, is_initiator: bool):
-        """Runs the full lifecycle for one peer: handshake then message loop.
-
-        Args:
-            peer_id: The remote peer's ID.
-            is_initiator: True if we sent the offer; False if we received it.
-                The initiator receives the roster; the receiver sends it.
-        """
+    async def _peer_session(self, st: PeerState, queue: asyncio.Queue, is_initiator: bool):
+        """Runs the full lifecycle for one channel: handshake, then idle pump."""
+        key = st.channel_key
         try:
-            await self._handshake(peer_id, is_initiator)
-            await self._message_loop(peer_id)
+            await asyncio.wait_for(
+                self._handshake(st, queue, is_initiator), self._handshake_timeout
+            )
+            while self.running:
+                item = await queue.get()
+                if item is None:
+                    break
+        except AuthenticationError as exc:
+            self._fail_join(key, exc)
+            self._emit("error", text=f"authentication failed with a peer — {exc}")
+        except (ProtocolError, asyncio.TimeoutError) as exc:
+            reason = exc if isinstance(exc, ProtocolError) else ProtocolError("handshake timed out")
+            self._fail_join(key, reason)
+            if st.ready or not isinstance(exc, asyncio.TimeoutError):
+                self._emit("info", text=f"connection to a peer failed: {reason}")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
         finally:
-            state = self._peers.pop(peer_id, None)
-            self._peer_queues.pop(peer_id, None)
-            if state and state.username:
-                self.messages.append(
-                    {"username": "—", "text": f"{state.username} left", "timestamp": self._now()}
-                )
-                self.render()
-            asyncio.create_task(self._reevaluate_room_holder())
+            superseded = self._states.get(key) is not st
+            if not superseded:
+                self._states.pop(key, None)
+            if self._queues.get(key) is queue:
+                self._queues.pop(key, None)
+            self._after_session(st, superseded)
 
-    async def _handshake(self, peer_id: str, is_initiator: bool):
-        """Executes the four-step handshake with a newly connected peer.
+    def _fail_join(self, channel_key: str, exc: Exception):
+        if self._join_future and channel_key == self.join_id and not self._join_future.done():
+            self._join_future.set_exception(exc)
 
-        Steps (both sides run concurrently):
+    def _after_session(self, st: PeerState, superseded: bool):
+        """Post-session bookkeeping: departures, reconnects, room re-election."""
+        real = st.peer_id
+        if superseded or not st.ready or real is None:
+            return
+        if self.running:
+            if real in self._departing:
+                self._departing.discard(real)
+                self._finalize_departure(real)
+            elif real not in self._reconnecting:
+                self._begin_reconnect(real, st.username or real)
+        self._emit_presence()
+        if self.running:
+            self._track(asyncio.create_task(self._reevaluate_room_holder()))
 
-        1. **kex** — exchange ephemeral X25519 public keys and derive the
-           pairwise key via ``HKDF(ecdh_secret ‖ password)``.
-        2. **sender_key** — exchange sender keys encrypted with the pairwise
-           key. After this step both peers can encrypt/decrypt chat messages.
-        3. **roster** — the receiver (host) sends the list of existing peer
-           IDs and the room ID; the initiator (joiner) connects to each.
-        4. **join** — exchange display names.
+    async def _handshake(self, st: PeerState, queue: asyncio.Queue, is_initiator: bool):
+        """SPAKE2 + X25519 handshake with explicit key confirmation.
 
-        Args:
-            peer_id: The remote peer's ID.
-            is_initiator: True if we sent the WebRTC offer.
+        Both sides run the same steps concurrently:
+
+        1. **kex** — exchange real peer IDs, SPAKE2 messages, X25519 keys.
+        2. **confirm** — exchange MACs over own peer ID; a mismatch means the
+           passwords differ and raises :class:`AuthenticationError` loudly.
+        3. **sec** — exchange pairwise-encrypted sender keys and usernames;
+           the host side additionally sends the roster and room ID.
         """
         assert self._peer is not None
-        assert self._private_key is not None
-        assert self._sender_key is not None
-        state = self._peers[peer_id]
-        queue = self._peer_queues[peer_id]
-
-        # kex — both sides send simultaneously, then wait
-        pub_bytes = self._private_key.public_key().public_bytes_raw()
-        await self._peer.send_to(
-            peer_id,
-            json.dumps({"type": "holler.kex", "pubkey": base64.b64encode(pub_bytes).decode()}),
+        key = st.channel_key
+        hs = PairwiseHandshake(self.password)
+        spake_msg, pub = hs.outbound()
+        await self._send(
+            key,
+            {
+                "type": "holler.kex",
+                "peer": self._peer.peer_id,
+                "spake": _b64e(spake_msg),
+                "pub": _b64e(pub),
+            },
         )
-        data = json.loads(await asyncio.wait_for(queue.get(), timeout=30))
-        assert data["type"] == "holler.kex"
+        data = await self._expect(queue, "holler.kex")
+        real = data.get("peer")
+        if not isinstance(real, str) or not (1 <= len(real) <= 64):
+            raise ProtocolError("invalid peer id in key exchange")
+        if real == self._peer.peer_id:
+            raise ProtocolError("peer claims our own id")
+        st.peer_id = real
+        st.pairwise = hs.finish(_b64d(data, "spake"), _b64d(data, "pub"))
 
-        pairwise_key = self._derive_pairwise_key(base64.b64decode(data["pubkey"]))
-        state.pairwise_fernet = Fernet(base64.urlsafe_b64encode(pairwise_key))
-
-        # sender key exchange — both sides send, then wait
-        encrypted_sender = state.pairwise_fernet.encrypt(self._sender_key)
-        await self._peer.send_to(
-            peer_id,
-            json.dumps(
-                {"type": "holler.sender_key", "key": base64.b64encode(encrypted_sender).decode()}
-            ),
+        await self._send(
+            key,
+            {
+                "type": "holler.confirm",
+                "mac": _b64e(st.pairwise.confirmation(self._peer.peer_id)),
+            },
         )
-        data = json.loads(await asyncio.wait_for(queue.get(), timeout=30))
-        assert data["type"] == "holler.sender_key"
+        data = await self._expect(queue, "holler.confirm")
+        if not st.pairwise.verify_confirmation(real, _b64d(data, "mac")):
+            raise AuthenticationError("key confirmation failed (wrong password?)")
 
-        their_key = state.pairwise_fernet.decrypt(base64.b64decode(data["key"]))
-        state.their_sender_fernet = Fernet(base64.urlsafe_b64encode(their_key))
-
-        # roster — host sends peer list + room_id, joiner connects to them
+        sec: dict = {"sender_key": _b64e(self._sender_key), "username": self.username}
         if not is_initiator:
-            other_peers = [pid for pid in self._peers if pid != peer_id]
-            await self._peer.send_to(
-                peer_id,
-                json.dumps(
-                    {"type": "holler.roster", "peers": other_peers, "room_id": self._room_id}
-                ),
-            )
-        else:
-            data = json.loads(await asyncio.wait_for(queue.get(), timeout=30))
-            assert data["type"] == "holler.roster"
-            self._room_id = data.get("room_id")
-            for pid in data.get("peers", []):
-                asyncio.create_task(self._connect_to_peer(pid))
-
-        # username exchange
-        await self._peer.send_to(
-            peer_id, json.dumps({"type": "join", "username": self.username})
+            sec["roster"] = [
+                s.peer_id
+                for s in self._states.values()
+                if s.ready and s.peer_id and s.peer_id != real
+            ]
+            sec["room_id"] = self._room_id
+        blob = st.pairwise.encrypt(
+            json.dumps(sec).encode(), b"holler.sec:" + self._peer.peer_id.encode()
         )
-        data = json.loads(await asyncio.wait_for(queue.get(), timeout=30))
-        assert data["type"] == "join"
-        state.username = data["username"]
+        await self._send(key, {"type": "holler.sec", "blob": _b64e(blob)})
+        data = await self._expect(queue, "holler.sec")
+        plaintext = st.pairwise.decrypt(_b64d(data, "blob"), b"holler.sec:" + real.encode())
+        try:
+            sec_in = json.loads(plaintext)
+        except (json.JSONDecodeError, ValueError):
+            raise ProtocolError("malformed secure payload") from None
 
-        self._first_peer_ready.set()
-        self._info(f"{state.username} joined")
-        self.render()
-        asyncio.create_task(self._reevaluate_room_holder())
+        username = sec_in.get("username")
+        if not isinstance(username, str) or not username.strip():
+            raise ProtocolError("missing username")
+        try:
+            their_sender_key = base64.b64decode(sec_in.get("sender_key", ""), validate=True)
+        except Exception:
+            raise ProtocolError("invalid sender key") from None
+        if len(their_sender_key) != 32:
+            raise ProtocolError("invalid sender key length")
 
-    async def _message_loop(self, peer_id: str):
-        state = self._peers[peer_id]
-        queue = self._peer_queues[peer_id]
+        st.username = username.strip()[:64]
+        self._store_sender_key(real, their_sender_key)
+        self._usernames[real] = st.username
 
-        while self.running:
-            try:
-                raw = await asyncio.wait_for(queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        if is_initiator:
+            room = sec_in.get("room_id")
+            if isinstance(room, str) and self._room_id is None:
+                self._room_id = room
+            for pid in sec_in.get("roster") or []:
+                if isinstance(pid, str) and pid:
+                    self._track(asyncio.create_task(self._connect_to_peer(pid)))
 
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+        was_reconnecting = real in self._reconnecting
+        st.ready = True
+        verb = "reconnected" if was_reconnecting else "joined"
+        self._emit("info", text=f"{st.username} {verb}")
+        self._emit_presence()
+        if self._join_future and key == self.join_id and not self._join_future.done():
+            self._join_future.set_result(None)
+        self._track(asyncio.create_task(self._reevaluate_room_holder()))
 
-            t = data.get("type")
-            if t == "message":
-                assert state.their_sender_fernet is not None
-                try:
-                    text = state.their_sender_fernet.decrypt(data["text"].encode()).decode()
-                except Exception:
-                    text = "[decrypt failed]"
-                self.messages.append(
-                    {
-                        "username": data.get("username", "?"),
-                        "text": text,
-                        "timestamp": data.get("timestamp", ""),
-                    }
-                )
-                self.render()
-            elif t in ("leave", "_disconnect"):
-                break
+    async def _expect(self, queue: asyncio.Queue, msg_type: str) -> dict:
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=20)
+        except asyncio.TimeoutError:
+            raise ProtocolError(f"timed out waiting for {msg_type}") from None
+        if item is None:
+            raise ProtocolError("peer disconnected during handshake")
+        if item.get("type") != msg_type:
+            raise ProtocolError(f"expected {msg_type}, got {item.get('type')!r}")
+        return item
 
-    async def _input_loop(self):
-        assert self._sender_fernet is not None
+    def _store_sender_key(self, real_id: str, new_key: bytes):
+        """Stores a peer's sender key, keeping the previous one as a fallback."""
+        old = self._sender_keys.get(real_id, [])
+        self._sender_keys[real_id] = [new_key] + [k for k in old if k != new_key][:1]
+
+    # ── gossip ────────────────────────────────────────────────────────────────
+
+    def _gossip_aad(self, msg_id: str, origin: str, lam: int, kind: str) -> bytes:
+        return f"holler.gossip:{msg_id}:{origin}:{lam}:{kind}".encode()
+
+    async def _gossip_out(self, kind: str, payload: dict) -> "tuple[str, int]":
+        """Seals ``payload`` with our sender key and broadcasts the envelope."""
         assert self._peer is not None
-        loop = asyncio.get_event_loop()
-        while self.running:
+        origin = self._peer.peer_id
+        msg_id = secrets.token_hex(8)
+        lam = self._clock.tick()
+        aad = self._gossip_aad(msg_id, origin, lam, kind)
+        blob = seal(self._sender_key, json.dumps(payload).encode(), aad)
+        self._seen.check_and_add(msg_id)
+        envelope = json.dumps(
+            {
+                "type": "holler.gossip",
+                "id": msg_id,
+                "origin": origin,
+                "ttl": GOSSIP_TTL,
+                "lam": lam,
+                "kind": kind,
+                "blob": _b64e(blob),
+            }
+        )
+        for st in list(self._states.values()):
+            if st.ready:
+                await self._peer.send_to(st.channel_key, envelope)
+        return msg_id, lam
+
+    def _handle_gossip(self, via_key: str, msg: dict):
+        assert self._peer is not None
+        msg_id = msg.get("id")
+        origin = msg.get("origin")
+        ttl = msg.get("ttl")
+        lam = msg.get("lam")
+        kind = msg.get("kind")
+        blob64 = msg.get("blob")
+        if not (
+            isinstance(msg_id, str)
+            and isinstance(origin, str)
+            and isinstance(ttl, int)
+            and isinstance(lam, int)
+            and isinstance(kind, str)
+            and isinstance(blob64, str)
+            and 0 < ttl <= 32
+            and 0 <= lam
+            and len(msg_id) <= 64
+            and len(origin) <= 64
+        ):
+            return
+        if not self._seen.check_and_add(msg_id):
+            return
+        if origin == self._peer.peer_id:
+            return
+        self._clock.update(lam)
+
+        payload: Optional[dict] = None
+        keys = self._sender_keys.get(origin)
+        if keys:
             try:
-                text = await loop.run_in_executor(None, input)
-                if text.lower() in ("q", "quit", "exit"):
-                    self.running = False
-                    break
-                if text.strip():
-                    encrypted = self._sender_fernet.encrypt(text.encode()).decode()
-                    await self._peer.broadcast(
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "username": self.username,
-                                "text": encrypted,
-                                "timestamp": self._now(),
-                            }
-                        )
-                    )
-            except (EOFError, KeyboardInterrupt):
-                self.running = False
-                break
-
-    async def run_async(self):
-        """Runs the full client lifecycle: connect, chat, disconnect."""
-        self.console.clear()
-        self.console.print(Panel("[bold cyan]holler[/]", expand=False))
-
-        self._generate_keypair()
-        self._generate_sender_key()
-
-        self._peer = PeerConnection()
-        self._peer.on_message = self._on_message
-        self._peer.on_peer_connected = self._on_peer_connected
-        self._peer.on_peer_disconnected = self._on_channel_closed
-
-        await self._peer.start()
-
-        if not self.join_id:
-            self._room_id = _rand()
-            await self._acquire_room()
-            self.console.print(f"\n[bold]Room ID:[/] [yellow]{self._room_id}[/]")
-            self.console.print("[dim]Share this with peers to invite them.[/]\n")
-            self.running = True
-        else:
-            with self.console.status("[cyan]Connecting...[/]", spinner="dots"):
-                await self._connect_to_peer(self.join_id)
-                await self._first_peer_ready.wait()
-            self.running = True
-            self.render()
-
-        try:
-            await self._input_loop()
-        finally:
-            self.running = False
-            try:
-                if self._holding_room:
-                    await self._release_room()
-                await self._peer.broadcast(
-                    json.dumps({"type": "leave", "username": self.username})
-                )
-                await asyncio.sleep(0.1)
+                aad = self._gossip_aad(msg_id, origin, lam, kind)
+                raw = open_any(keys, base64.b64decode(blob64), aad)
+                decoded = json.loads(raw)
+                if isinstance(decoded, dict):
+                    payload = decoded
             except Exception:
-                pass
-            await self._peer.close()
-            self.console.print("\n[yellow]Disconnected[/]")
+                return  # forged or corrupted — do not deliver, do not forward
 
-    def run(self):
-        """Blocking entry point. Calls ``run_async`` inside ``asyncio.run``."""
+        if ttl > 1:
+            forwarded = dict(msg)
+            forwarded["ttl"] = ttl - 1
+            raw_out = json.dumps(forwarded)
+            for st in list(self._states.values()):
+                if st.ready and st.channel_key != via_key:
+                    self._track(asyncio.create_task(self._peer.send_to(st.channel_key, raw_out)))
+
+        if payload is None:
+            return
+        username = self._usernames.get(origin, "?")
+        if kind == "chat":
+            text = payload.get("text")
+            wall = payload.get("wall")
+            if isinstance(text, str):
+                self._append_log(
+                    lam, origin, msg_id, username, text, wall if isinstance(wall, str) else ""
+                )
+        elif kind == "leave":
+            self._handle_peer_leave(origin)
+        elif kind == "typing":
+            if username != "?":
+                self._typing[username] = time.monotonic()
+                self._emit("typing", users=sorted(self._typing))
+
+    def _handle_rekey(self, st: PeerState, data: dict):
+        if not st.pairwise or not st.peer_id:
+            return
         try:
-            asyncio.run(self.run_async())
-        except KeyboardInterrupt:
-            pass
+            plaintext = st.pairwise.decrypt(
+                _b64d(data, "blob"), b"holler.rekey:" + st.peer_id.encode()
+            )
+            new_key = base64.b64decode(json.loads(plaintext)["sender_key"], validate=True)
+        except Exception:
+            return
+        if len(new_key) == 32:
+            self._store_sender_key(st.peer_id, new_key)
+
+    # ── membership changes ────────────────────────────────────────────────────
+
+    def _handle_peer_leave(self, origin: str):
+        """Processes a graceful leave announcement from ``origin``."""
+        self._departing.add(origin)
+        st = self._find_ready(origin)
+        if st:
+            assert self._peer is not None
+            self._track(asyncio.create_task(self._peer.drop(st.channel_key)))
+        else:
+            self._departing.discard(origin)
+            self._finalize_departure(origin)
+
+    def _finalize_departure(self, real_id: str, suffix: str = ""):
+        """Forgets a departed peer and rotates our sender key."""
+        username = self._usernames.pop(real_id, None)
+        had_keys = self._sender_keys.pop(real_id, None) is not None
+        if username is None and not had_keys:
+            return
+        self._emit("info", text=f"{username or real_id} left{suffix}")
+        self._emit_presence()
+        if self.running:
+            self._track(asyncio.create_task(self._rotate_sender_key()))
+            self._track(asyncio.create_task(self._reevaluate_room_holder()))
+
+    async def _rotate_sender_key(self):
+        """Generates a fresh sender key and distributes it pairwise.
+
+        Called when the group shrinks so a departed member cannot decrypt
+        future traffic even if they somehow kept receiving ciphertext.
+        """
+        if not self.running or self._peer is None:
+            return
+        self._sender_key = os.urandom(32)
+        plaintext = json.dumps({"sender_key": _b64e(self._sender_key)}).encode()
+        aad = b"holler.rekey:" + self._peer.peer_id.encode()
+        for st in list(self._states.values()):
+            if st.ready and st.pairwise:
+                blob = st.pairwise.encrypt(plaintext, aad)
+                await self._send(st.channel_key, {"type": "holler.rekey", "blob": _b64e(blob)})
+
+    # ── liveness & reconnection ───────────────────────────────────────────────
+
+    def _begin_reconnect(self, real_id: str, username: str):
+        if real_id in self._reconnecting or not self.running:
+            return
+        self._reconnecting.add(real_id)
+        self._track(asyncio.create_task(self._reconnect(real_id, username)))
+
+    async def _reconnect(self, real_id: str, username: str):
+        """Attempts to restore a dead link; lower peer ID redials, higher waits.
+
+        Redial and wait both end in a fresh full handshake (new SPAKE2, new
+        X25519, re-exchanged sender keys). After the backoff schedule is
+        exhausted the peer is declared gone.
+        """
+        assert self._peer is not None
+        self._emit("info", text=f"connection to {username} lost — reconnecting…")
+        success = False
+        try:
+            if self._peer.peer_id < real_id:
+                for delay in self._reconnect_delays:
+                    if not self.running:
+                        return
+                    if self._find_ready(real_id):
+                        success = True
+                        break
+                    self._initiated.add(real_id)
+                    try:
+                        await self._peer.connect_to(real_id, timeout=20)
+                    except Exception:
+                        self._initiated.discard(real_id)
+                        await asyncio.sleep(delay)
+                        continue
+                    if await self._await_ready(real_id, self._handshake_timeout):
+                        success = True
+                        break
+            else:
+                total = sum(self._reconnect_delays) + self._handshake_timeout
+                success = await self._await_ready(real_id, total)
+        finally:
+            self._reconnecting.discard(real_id)
+        if not success and self.running:
+            self._finalize_departure(real_id, suffix=" (unreachable)")
+
+    async def _await_ready(self, real_id: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.running:
+            if self._find_ready(real_id):
+                return True
+            await asyncio.sleep(0.1)
+        return self._find_ready(real_id) is not None
+
+    async def _monitor(self):
+        """Periodic housekeeping: pings, staleness detection, typing expiry."""
+        assert self._peer is not None
+        ping = json.dumps({"type": "holler.ping"})
+        tick = 0
+        while self.running:
+            await asyncio.sleep(self._ping_interval)
+            tick += 1
+            now = time.monotonic()
+            for st in list(self._states.values()):
+                if not st.ready:
+                    continue
+                await self._peer.send_to(st.channel_key, ping)
+                real = st.peer_id
+                if (
+                    real
+                    and now - st.last_seen > self._stale_after
+                    and real not in self._reconnecting
+                    and real not in self._departing
+                ):
+                    self._begin_reconnect(real, st.username or real)
+                    await self._peer.drop(st.channel_key)
+            expired = [u for u, ts in self._typing.items() if now - ts > TYPING_EXPIRY]
+            if expired:
+                for u in expired:
+                    del self._typing[u]
+                self._emit("typing", users=sorted(self._typing))
+            if tick % 3 == 0:
+                await self._reevaluate_room_holder()
