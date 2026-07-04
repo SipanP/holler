@@ -10,6 +10,8 @@
 
 Holler connects any number of terminals in a fully encrypted group chat using WebRTC. A PeerJS signaling server brokers the initial handshakes — after that, it's completely out of the picture. Messages travel peer-to-peer only.
 
+📖 **[The Holler Guide](docs/GUIDE.md)** — quick start, a tour of the codebase, and first-principles explanations (with proofs and diagrams) of every algorithm used: UDP hole punching, SPAKE2, AES-GCM, gossip routing, Lamport clocks, and more. Also published on the [project wiki](../../wiki) on every push to `main`.
+
 ## How it works
 
 Peers form a full mesh: every participant holds a direct DataChannel to every other participant. When a new peer joins, they receive a roster of existing members and establish connections to each one independently.
