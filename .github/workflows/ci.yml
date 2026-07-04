@@ -58,3 +58,37 @@ jobs:
           else
             echo "::warning title=E2E smoke test failed::Live test against 0.peerjs.com failed. This does not block the pipeline — it may be a transient network or third-party outage, but check the job log in case a real regression is hiding here."
           fi
+
+  # Publish docs/wiki/ to the GitHub wiki so the guide is easy to find on
+  # GitHub. The wiki is a separate git repository; this job makes it an exact
+  # mirror of docs/wiki/ on every push to main (each .md file becomes a wiki
+  # page, _Sidebar.md becomes the navigation). Edit docs/wiki/ via PRs —
+  # direct wiki edits are overwritten by the next sync.
+  publish-wiki:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync docs/wiki to the GitHub wiki
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki; then
+            echo "::warning title=Wiki publish skipped::Could not clone the wiki repository. Initialize the wiki once (repo → Wiki tab → Create the first page, any content) and this job will publish the guide automatically on the next push to main."
+            exit 0
+          fi
+          find wiki -maxdepth 1 -name '*.md' -delete
+          cp docs/wiki/*.md wiki/
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "wiki already up to date"
+          else
+            git commit -m "Sync wiki from docs/wiki @ ${GITHUB_SHA}"
+            git push
+          fi
